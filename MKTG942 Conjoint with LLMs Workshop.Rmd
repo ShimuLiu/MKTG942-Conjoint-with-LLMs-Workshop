@@ -1,0 +1,219 @@
+---
+title: "Conjoint with LLMs"
+output: github_document
+author: "Shimu Liu"
+date: "2025-05-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Introduction:
+In this workshop, we'll demonstrate how to simulate a conjoint analysis 
+based on Brand et al.(2024)'s paper using LLMs via API in R. Here's the overall 
+guideline:
+
+1. Design product profiles (e.g., laptops)
+
+2. Generate prompts for LLM
+
+3. Send requests using API
+
+4. Parse responses to simulate consumer choices
+
+Start Implementation:
+
+1.a Load Libraries
+```{r}
+# Load required packages
+# httr and jsonlite are used for sending HTTP requests and handling JSON responses
+library(httr)       # For API requests
+library(purrr)      # For functional programming
+library(dplyr)      # For data manipulation
+library(tibble)     # For tidy data frames
+library(jsonlite)   # For JSON handling
+library(tidyr)      # For data tidying
+library(readr)      # For reading/writing CSV files
+```
+
+1.b Set API Key
+(https://openrouter.ai/)
+OpenRouter is a unified API platform that provides streamlined access to a wide array of large language models (LLMs)
+
+We define our OpenRouter API key and specify which LLM to use. For this example, we use the "deepseek/deepseek-chat-v3-0324:free" model. You can substitute any other OpenRouter-compatible model here.
+
+```{r}
+# Set your OpenRouter API key
+#Sys.setenv(OPENROUTER_API_KEY = "Your API Key")
+
+Sys.setenv(OPENROUTER_API_KEY =  "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")
+
+
+# DeepSeek model specification
+deepseek_model <- "deepseek/deepseek-chat-v3-0324:free"
+
+
+```
+
+2. Design Conjoint Profiles
+```{r}
+# Define product attributes
+brands <- c("Microsoft Surface Laptop", "Apple Macbook Air")
+prices <- c("$1000", "$1200", "$1400")
+rams <- c("8GB", "16GB", "32GB")
+storages <- c("256GB", "512GB", "1TB")
+sizes <- c("13in", "15in")
+
+# Create all possible product combinations
+generate_product_profiles <- function() {
+  expand.grid(
+    Brand = brands,
+    Price = prices,
+    Size = sizes,
+    RAM = rams,
+    Storage = storages,
+    stringsAsFactors = FALSE
+  ) %>% 
+    mutate(ProductID = paste0("P", row_number()))
+}
+
+products <- generate_product_profiles()
+print(products)
+```
+
+3. Generate Prompts
+```{r}
+# Defines a function to generate comparison prompt
+generate_prompt <- function(product1, product2) {
+  #sprintf() is used to create a formatted string
+  prompt1 <- sprintf("%s, Price: %s, RAM: %s, Storage: %s, Size: %s",
+                    product1$Brand, 
+                    product1$Price, 
+                    product1$RAM, 
+                    product1$Storage, 
+                    product1$Size)
+  
+  prompt2 <- sprintf("%s, Price: %s, RAM: %s, Storage: %s, Size: %s",
+                    product2$Brand, 
+                    product2$Price, 
+                    product2$RAM, 
+                    product2$Storage, 
+                    product2$Size)
+  
+  # Create the final prompt
+  # 1. system message
+  sys_msg <- list(
+    role    = "system",
+    content = paste(
+      "You are a customer. You are selected at random while shopping",
+      "for laptops to participate in a survey. The interviewer will describe the",
+      "options you saw while shopping and ask you to report which option you chose",
+      "to purchase. Whenever two options are shown, you can also choose a third",
+      "option which is not to purchase anything that day."
+    )
+  )
+  
+  # 2. user message
+  usr_msg <- list(
+    role    = "user",
+    content = sprintf(
+      paste(
+        "Option 1: %s\n",
+        "Option 2: %s\n\n",
+        "Which option do you choose? Respond ONLY with:\n",
+        "- '1' for Option 1\n",
+        "- '2' for Option 2\n",
+        "- '0' if you choose not to purchase anything"
+      ),
+      prompt1, prompt2
+    )
+  )
+  
+  # 3. bundle them for the API call
+  combined_content <- paste(sys_msg$content, usr_msg$content, sep = "\n\n")
+  return(combined_content)
+}
+
+
+# Function to create all unique product pairs with prompts
+generate_product_pairs <- function(products, iterations) {
+  all_pairs <- combn(products$ProductID, 2, simplify = FALSE)
+  sampled_pairs <- sample(all_pairs, min(iterations, length(all_pairs)))
+  
+  map_dfr(sampled_pairs, ~ {
+    p1 <- products %>% filter(ProductID == .x[1])
+    p2 <- products %>% filter(ProductID == .x[2])
+    tibble(
+      Product1_ID = p1$ProductID,
+      Product2_ID = p2$ProductID,
+      Prompt = generate_prompt(p1, p2)
+    )
+  })
+}
+
+pairs_df <- generate_product_pairs(products, iterations = 20)
+#Inspect the first few rows of the generated prompts
+head(pairs_df)
+pairs_df$Prompt[[1]]
+
+```
+
+4. Send Requests to API
+Check for more standard guidance:
+https://openrouter.ai/deepseek/deepseek-chat-v3-0324:free/api
+```{r}
+query_llm <- function(prompt) {
+  res <- POST(
+    url = "https://openrouter.ai/api/v1/chat/completions",
+    add_headers(
+      "Authorization" = paste("Bearer", Sys.getenv("OPENROUTER_API_KEY")),
+      "User-Agent" = "demo"
+    ),
+    encode = "json",
+    body = toJSON(list(
+      model = "deepseek/deepseek-chat-v3-0324:free",
+      messages = list(list(role = "user", content = prompt)),
+      max_tokens = 150
+    ), auto_unbox = TRUE)
+  )
+
+  raw <- content(res, "text", encoding = "UTF-8")
+  #print("=== Raw response ===")
+  #print(raw)
+
+  result <- fromJSON(raw, simplifyVector = FALSE)
+  content_text <- result$choices[[1]]$message$content
+
+  # Use regex to extract only the first 0, 1, or 2
+  library(stringr)
+  choice <- str_extract(content_text, "[012](?=\\s|$|\\b)")
+
+  print(paste("Model replied (cleaned):", choice))
+  return(choice)
+}
+
+
+```
+
+5.a Collect Responses
+```{r}
+
+# Run the study (comment out during testing)
+#slice the first 2 rows
+pairs_test <- pairs_df |> slice_head(n = 5)
+
+rate_limit_pause <- 10  
+print(pairs_test) 
+
+responses <- pairs_test %>%
+  mutate(Response = map_chr(Prompt, ~ {
+    Sys.sleep(rate_limit_pause)
+    query_llm(.x)  # capture the choice directly
+  }))
+
+head(responses)
+```
+
+Reference:
+Brand, James, et al. “Using LLMs for Market Research.” SSRN Electronic Journal, 2023, https://doi.org/10.2139/ssrn.4395751.
